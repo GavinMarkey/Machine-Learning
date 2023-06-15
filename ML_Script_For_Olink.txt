@@ -1,0 +1,221 @@
+#Hierarchical clustering ---- 
+
+# Load required packages
+library(tidyverse)
+library(cluster)
+library(EnhancedVolcano)
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(plotROC)
+library(MLeval)
+
+#set working directory
+setwd("C:/Clustering")
+
+# import data
+input_data <- read.csv("COVRES_Olink_Complete.csv")
+
+
+patient_data <- read.csv("patient_data.csv")
+
+#normilisation 
+
+z <- input_data[,-c(1,2,3,4,5)]
+m <- apply(z,2,mean)
+s <- apply(z,2,sd)
+z <- scale(z,m,s)
+
+# calculating euclidean distance
+
+distance <- dist(z)
+print(distance, digits=3)
+
+#clustering
+hc.l <- hclust(distance)
+
+rounded_labels <- round(input_data$Hospitalised, 2)
+
+plot(hc.l, labels = input_data$Hospitalised, main = "Hierarchical clustering dendogram using Full Olink Inflammation Panel")
+
+
+# pairing input data
+pairs(input_data[06:08])
+
+plot(IL1RN~AMBN,input_data, main = "IL1RN expression", pch = 18, col = "red",labels = row.names(input_data$Hospitalised))
+text(x = input_data$Study_id_number, y = input_data$IL1RN, labels = input_data[, 2], pos = 4)
+
+plot(TREM2 ~ Study_id_number, data = input_data, main = "IL1RN expression", pch = 18, col = "red")
+text(x = input_data$Study_id_number, y = input_data$IL1RN, labels = input_data[, 1], pos = 1)
+
+
+
+EnhancedVolcano(input_data, lab = input_data$Hospitalised, x = "Study_id_number", y = "IL1RN", pCutoff = 1e+2,0,-2,  ylim = c(-3,3), pointSize = 2.0, labSize = 4, drawConnectors = TRUE, widthConnectors = 0.8, arrowheads = FALSE, labCol = "black",labFace = "plain")
+
+# SVM model ----
+
+library(caret)
+library(LiblineaR)
+library(skimr)
+
+# Importing COVRES data
+data <- read.csv("COVRES_Olink_Over_90_Days.csv")
+
+# Check to see if there are missing data?
+sum(is.na(data))
+
+# To achieve reproducible model; set the random seed number
+set.seed(100)
+
+# Performs stratified random split of the data set
+TrainingIndex <- createDataPartition(data$Hospitalised, p=0.8, list = FALSE)
+TrainingSet <- data[TrainingIndex,] # Training Set
+TestingSet <- data[-TrainingIndex,] # Test Set
+
+##Removing Meta information
+
+TrainingSet <- TrainingSet[, -c(1,2,3,4)]
+TestingSet <- TestingSet[, -c(1,2,3,4)]
+
+
+# Factoring Training and testing data
+
+TrainingSet$Hospitalised <- factor(TrainingSet$Hospitalised, levels = c("Hospitalised", "NonHospitalised"))
+TestingSet$Hospitalised <- factor(TestingSet$Hospitalised, levels = c("Hospitalised", "NonHospitalised"))
+
+preProcValues <- preProcess(TestingSet, method = c("center", "scale"))
+preProcValues <- preProcess(TestingSet, method = c("range"))
+
+
+TestingSet <- predict(preProcValues, TestingSet)
+
+# Tuning hyperparameter
+
+hyperparamsGrid <- expand.grid(degree = 1:3, scale = c(0.1, 1, 10), C = c(0.01, 0.1, 1))
+
+
+
+# Modify predictor variable names to valid R variable names
+
+# SVM Model 
+Model <- train(as.factor(Hospitalised) ~ ., 
+               data = TrainingSet,
+               method = "svmPoly",
+               preProcess = c("scale", "center"),
+               na.action = na.omit,
+               tuneGrid = data.frame(degree=1,scale=1,C=1),
+               trControl = trainControl(method = "none"))
+
+
+
+
+# Cross validation model
+Model.cv <- train(as.factor(Hospitalised) ~ ., 
+               data = TrainingSet,
+               method = "svmPoly",
+               na.action = na.omit,
+               tuneGrid = hyperparamsGrid,
+               trControl = trainControl(method = "repeatedcv", 
+                                        repeats = 10, 
+                                        classProbs = TRUE,
+                                        savePredictions = TRUE))
+
+
+
+
+
+# Predicted classes
+Model.training <-predict(Model, TrainingSet) 
+Model.testing <-predict(Model, TestingSet) 
+Model.cv.training <-predict(Model.cv, TrainingSet) 
+Model.cv.testing <-predict(Model.cv, TestingSet)
+# Model performance (Displays confusion matrix and statistics)
+Model.training.confusion <-confusionMatrix(Model.training, TrainingSet$Hospitalised)
+Model.testing.confusion <-confusionMatrix(Model.testing, TestingSet$Hospitalised)
+Model.cv.confusion <-confusionMatrix(Model.cv.training, TrainingSet$Hospitalised)
+Model.cv.testing.confusion <-confusionMatrix(Model.cv.testing, TestingSet$Hospitalised)
+
+print(Model.training.confusion)
+print(Model.cv.testing.confusion)
+print(Model.cv.confusion)
+print(Model.cv.testing.confusion)
+# Feature importance
+Importance <- varImp(Model.cv)
+plot(Importance)
+plot(Importance, col = "red", top = 10, main = "Hospitilisation status Variable Importance At 90 Days (SVM)")
+
+# Predicted VS observed ----
+
+Model.training.prob <- predict(Model.cv, TrainingSet, type = "prob")
+hospitalised.status <- TrainingSet$Hospitalised
+prob_status_combined <- bind_cols(Model.training.prob, observed=hospitalised.status) %>%
+  select(Hospitalised, observed)
+
+#counting observations
+total <- prob_status_combined %>%
+  count(observed)  %>%
+  pivot_wider(names_from = observed, values_from=n)
+
+# sorting
+prob_status_combined %>%
+  arrange(desc(Hospitalised)) %>%
+  mutate(is_Hospitalised = (observed == "Hospitalised"),
+        tp = cumsum(is_Hospitalised),
+        fp = cumsum(!is_Hospitalised),
+        sensitivity = tp / total$Hospitalised,
+        fpr = fp / total$NonHospitalised,
+        specificity = 1-fpr) %>%
+  select(sensitivity,specificity,fpr)
+
+
+
+# Output predictions
+
+selectedIndices <- Model.cv$pred %>%
+  select(pred,obs,Hospitalised,NonHospitalised)
+
+# ROC-AUC & other plots ----
+
+res <- evalm(Model.cv)
+
+plot(Model$trainingData$LGALS9, col = "red" )
+
+# Extract the training data from the train object
+trainingData <- Model.cv$trainingData
+
+# Specify the columns to be plotted
+columns_to_plot <- c("LGALS9","TREM2", "PRSS8", "CD70", "PRSS8","AGRN", "IL6", "COLEC12","SPINK4", "TNFRSF11A")
+
+# Create a subset of the training data with the specified columns
+subset_data <- trainingData[, columns_to_plot]
+
+# Extract the response variable from the training data
+response <- trainingData$.outcome
+
+# Use the subset data and the response variable for featurePlot
+featurePlot(x = subset_data,
+            y = response,
+            plot = "box",
+            strip = strip.custom(par.strip.text = list(cex = 0.7)),
+            scales = list(x = list(relation = "free"),
+                          y = list(relation = "free")))
+
+
+## Random Forest ----
+
+RF <- train(as.factor(Hospitalised) ~ ., 
+               data = TrainingSet,
+               mtry = c(2, 4, 6, 8, 10),
+               ntree = c(50, 100, 150),
+               method = "rf")
+
+## Variable importance
+
+RF_Importance <- varImp(RF)
+plot(RF_Importance)
+plot(RF_Importance, col = "red", top = 5, main = "Hospitilisation status Variable Importance (Random Forest)")
+
+fitted <- predict(RF, TrainingSet)
+fitted[1:10]
+
+confusionMatrix(reference = TrainingSet$Hospitalised, data = fitted, mode = "everything", positive = "Hospitalised")
